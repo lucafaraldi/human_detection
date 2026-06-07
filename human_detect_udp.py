@@ -135,17 +135,26 @@ def main():
     print("UDP → {}:{}".format(args.receiver, args.port))
 
     # ── Camera ────────────────────────────────────────────────────────────
-    cap = cv2.VideoCapture(args.camera)
+    # Force V4L2 backend — required on Jetson Nano (default backend causes
+    # "select timeout" and null-Mat errors with both USB and CSI cameras).
+    cap = cv2.VideoCapture(args.camera, cv2.CAP_V4L2)
     if not cap.isOpened():
         sys.exit("Cannot open camera {}".format(args.camera))
-    print("Camera {} open. Press q or ESC to quit.\n".format(args.camera))
+
+    # Drain warmup frames — Jetson camera needs a few frames before it
+    # delivers valid data; reading too early returns a null Mat.
+    print("Warming up camera...")
+    for _ in range(10):
+        cap.read()
+        time.sleep(0.05)
+    print("Camera {} ready. Press q or ESC to quit.\n".format(args.camera))
 
     prev_flag  = None
     t0, frames = time.time(), 0
 
     while True:
         ret, frame = cap.read()
-        if not ret:
+        if not ret or frame is None or frame.size == 0:
             time.sleep(0.05)
             continue
 

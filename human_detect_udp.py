@@ -1,67 +1,146 @@
 #!/usr/bin/env python3
 """
-human_detect_udp.py
-───────────────────
-Runs YOLO pose detection on the Jetson camera and broadcasts a UDP packet
-each time the human-present state changes:
-    b'1'  → at least one human detected
-    b'0'  → no human detected
-The receiver (any device on the same network) just opens a UDP socket and
-reads one byte — no libraries, no connection setup needed on that side.
+human_detect_udp.py  —  Python 3.6 compatible
+───────────────────────────────────────────────
+Detects whether a human is present in the camera frame and broadcasts a
+UDP packet on state change:
+    b'\x01'  → human detected
+    b'\x00'  → no human
+
+Two detector backends, both use only opencv-python (no ultralytics / torch):
+
+  DETECTOR = "hog"     — OpenCV built-in HOG+SVM person detector.
+                         Zero extra setup.  Fast, good enough for close range.
+
+  DETECTOR = "yolov4"  — YOLOv4-tiny via OpenCV DNN.  More accurate.
+                         Needs a one-time download (see instructions below).
+
+YOLOv4-tiny download (run once):
+    wget https://raw.githubusercontent.com/AlexeyAB/darknet/master/cfg/yolov4-tiny.cfg
+    wget https://github.com/AlexeyAB/darknet/releases/download/darknet_yolo_v4_pre/yolov4-tiny.weights
+
 Usage:
-    python3 human_detect_udp.py --receiver 192.168.1.50
-    python3 human_detect_udp.py --receiver 192.168.1.50 --port 5005
-    python3 human_detect_udp.py --receiver 192.168.1.50 --every-frame  # heartbeat mode
-    python3 human_detect_udp.py --receiver 255.255.255.255             # LAN broadcast
+    python3 human_detect_udp.py
+    python3 human_detect_udp.py --every-frame
+    python3 human_detect_udp.py --receiver 192.168.1.50 --port 8221
 """
 
 import argparse
+import os
 import socket
 import sys
 import time
 
 import cv2
-from ultralytics import YOLO
 
 # ──────────────────────────────────────────────────── CONFIG
-DEFAULT_RECEIVER = "192.168.50.2"   # LAN broadcast; replace with specific IP
+DEFAULT_RECEIVER = "192.168.50.2"
 DEFAULT_UDP_PORT = 8221
 DEFAULT_CAMERA   = 0
-DEFAULT_MODEL    = "yolo11n-pose.pt"
-CONF_THRESHOLD   = 0.40
+CONF_THRESHOLD   = 0.40   # used by yolov4 backend
 
+# "hog" or "yolov4"
+DETECTOR = "hog"
+
+# Paths for yolov4 backend (only needed if DETECTOR = "yolov4")
+YOLO_CFG     = "yolov4-tiny.cfg"
+YOLO_WEIGHTS = "yolov4-tiny.weights"
+
+
+# ──────────────────────────────────────────────────── DETECTORS
+
+class HogDetector:
+    def __init__(self):
+        self.hog = cv2.HOGDescriptor()
+        self.hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+        print("Detector: OpenCV HOG (no download needed)")
+
+    def detect(self, frame):
+        # Resize to speed up; HOG is stride-sensitive to large images
+        small = cv2.resize(frame, (320, 240))
+        rects, _ = self.hog.detectMultiScale(
+            small,
+            winStride=(8, 8),
+            padding=(4, 4),
+            scale=1.05,
+        )
+        return len(rects) > 0, small
+
+
+class Yolov4Detector:
+    PERSON_CLASS = 0   # COCO class index for "person"
+
+    def __init__(self, cfg, weights, conf):
+        if not os.path.exists(cfg):
+            sys.exit(f"YOLOv4 config not found: {cfg}\n"
+                     "Download with:\n"
+                     "  wget https://raw.githubusercontent.com/AlexeyAB/"
+                     "darknet/master/cfg/yolov4-tiny.cfg")
+        if not os.path.exists(weights):
+            sys.exit(f"YOLOv4 weights not found: {weights}\n"
+                     "Download with:\n"
+                     "  wget https://github.com/AlexeyAB/darknet/releases/"
+                     "download/darknet_yolo_v4_pre/yolov4-tiny.weights")
+        self.conf  = conf
+        self.net   = cv2.dnn.readNetFromDarknet(cfg, weights)
+        self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+        self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+        layer_names    = self.net.getLayerNames()
+        unconnected    = self.net.getUnconnectedOutLayers()
+        # getUnconnectedOutLayers() returns shape (N,1) in older OpenCV
+        self.out_layers = [layer_names[i[0] - 1]
+                           if hasattr(i, '__len__') else layer_names[i - 1]
+                           for i in unconnected]
+        print("Detector: YOLOv4-tiny (OpenCV DNN)")
+
+    def detect(self, frame):
+        blob = cv2.dnn.blobFromImage(
+            frame, 1 / 255.0, (416, 416), swapRB=True, crop=False
+        )
+        self.net.setInput(blob)
+        outs = self.net.forward(self.out_layers)
+
+        h, w = frame.shape[:2]
+        for out in outs:
+            for detection in out:
+                scores  = detection[5:]
+                cls_id  = int(scores.argmax())
+                conf    = float(scores[cls_id])
+                if cls_id == self.PERSON_CLASS and conf >= self.conf:
+                    return True, frame
+        return False, frame
+
+
+# ──────────────────────────────────────────────────── MAIN
 
 def main():
     parser = argparse.ArgumentParser(description="Human detection → UDP flag")
-    parser.add_argument("--receiver",    default=DEFAULT_RECEIVER,
-                        help="Receiver IP (or 255.255.255.255 for LAN broadcast)")
-    parser.add_argument("--port",        default=DEFAULT_UDP_PORT, type=int,
-                        help="UDP destination port")
+    parser.add_argument("--receiver",    default=DEFAULT_RECEIVER)
+    parser.add_argument("--port",        default=DEFAULT_UDP_PORT, type=int)
     parser.add_argument("--camera",      default=DEFAULT_CAMERA,   type=int)
-    parser.add_argument("--model",       default=DEFAULT_MODEL)
     parser.add_argument("--conf",        default=CONF_THRESHOLD,   type=float)
     parser.add_argument("--every-frame", action="store_true",
-                        help="Send a packet every frame instead of only on change")
+                        help="Send a packet every frame, not just on change")
     args = parser.parse_args()
+
+    # ── Detector ──────────────────────────────────────────────────────────
+    if DETECTOR == "yolov4":
+        detector = Yolov4Detector(YOLO_CFG, YOLO_WEIGHTS, args.conf)
+    else:
+        detector = HogDetector()
 
     # ── UDP socket ────────────────────────────────────────────────────────
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    # Allow broadcast if using 255.255.255.255
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    print(f"UDP → {args.receiver}:{args.port}")
-
-    # ── Model ─────────────────────────────────────────────────────────────
-    print(f"Loading {args.model} ...")
-    model = YOLO(args.model)   # CUDA auto-selected on Jetson
-    print("Model ready.\n")
+    print("UDP → {}:{}".format(args.receiver, args.port))
 
     # ── Camera ────────────────────────────────────────────────────────────
     cap = cv2.VideoCapture(args.camera)
     if not cap.isOpened():
-        sys.exit(f"Cannot open camera {args.camera}")
-    print(f"Camera {args.camera} open. Press q or ESC to quit.\n")
+        sys.exit("Cannot open camera {}".format(args.camera))
+    print("Camera {} open. Press q or ESC to quit.\n".format(args.camera))
 
-    prev_flag = None
+    prev_flag  = None
     t0, frames = time.time(), 0
 
     while True:
@@ -70,29 +149,23 @@ def main():
             time.sleep(0.05)
             continue
 
-        # ── Inference ─────────────────────────────────────────────────────
-        results = model.predict(frame, conf=args.conf, verbose=False, classes=[0])
-        r = results[0] if results else None
-
-        human_present = (r is not None
-                         and r.boxes is not None
-                         and len(r.boxes) > 0)
+        human_present, vis = detector.detect(frame)
         flag = 1 if human_present else 0
 
         # ── UDP send ──────────────────────────────────────────────────────
         if args.every_frame or flag != prev_flag:
             sock.sendto(bytes([flag]), (args.receiver, args.port))
             prev_flag = flag
-            print(f"→ {flag}  ({'HUMAN' if flag else 'none':5s})")
+            print("→ {}  ({})".format(flag, "HUMAN" if flag else "none "))
 
-        # ── Display (comment out for headless) ────────────────────────────
-        annotated = r.plot() if r is not None else frame
+        # ── Display ───────────────────────────────────────────────────────
         frames += 1
         fps = frames / max(0.001, time.time() - t0)
-        cv2.putText(annotated, f"{fps:.1f} fps  {'HUMAN' if flag else '---'}",
-                    (8, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
-                    (0, 255, 0) if flag else (0, 80, 80), 2)
-        cv2.imshow("human_detect", annotated)
+        label = "{:.1f} fps  {}".format(fps, "HUMAN" if flag else "---")
+        colour = (0, 255, 0) if flag else (0, 80, 80)
+        cv2.putText(vis, label, (8, 28), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7, colour, 2)
+        cv2.imshow("human_detect", vis)
 
         key = cv2.waitKey(1) & 0xFF
         if key in (ord('q'), 27):

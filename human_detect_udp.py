@@ -111,6 +111,59 @@ class Yolov4Detector:
         return False, frame
 
 
+# ──────────────────────────────────────────────────── CAMERA OPEN
+
+def open_camera(index):
+    """
+    Open the camera robustly on Jetson Nano + old OpenCV.
+
+    Strategy (tried in order):
+      1. GStreamer V4L2 pipeline — bypasses the FFMPEG backend that causes
+         'select timeout' on Jetson.  Requires OpenCV built with GStreamer
+         (standard on JetPack).
+      2. Plain VideoCapture(index) — fallback for Mac / non-GStreamer builds.
+
+    Resolution is set low (320x240) to avoid format negotiation timeouts.
+    """
+    device = "/dev/video{}".format(index)
+
+    # Option 1: GStreamer pipeline
+    gst = (
+        "v4l2src device={} ! "
+        "video/x-raw,width=320,height=240,framerate=15/1 ! "
+        "videoconvert ! "
+        "video/x-raw,format=BGR ! "
+        "appsink drop=true sync=false"
+    ).format(device)
+
+    cap = cv2.VideoCapture(gst, cv2.CAP_GSTREAMER)
+    if cap.isOpened():
+        # Confirm frames actually arrive
+        for _ in range(5):
+            ret, frame = cap.read()
+            if ret and frame is not None and frame.size > 0:
+                print("Camera opened via GStreamer pipeline")
+                return cap
+        cap.release()
+
+    # Option 2: plain open (works on Mac; may hit select timeout on Jetson)
+    print("GStreamer failed, trying direct open...")
+    cap = cv2.VideoCapture(index)
+    if cap.isOpened():
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  320)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
+        cap.set(cv2.CAP_PROP_FPS, 15)
+        for _ in range(10):
+            ret, frame = cap.read()
+            time.sleep(0.05)
+            if ret and frame is not None and frame.size > 0:
+                print("Camera opened via direct VideoCapture")
+                return cap
+        cap.release()
+
+    return None
+
+
 # ──────────────────────────────────────────────────── MAIN
 
 def main():
@@ -135,18 +188,9 @@ def main():
     print("UDP → {}:{}".format(args.receiver, args.port))
 
     # ── Camera ────────────────────────────────────────────────────────────
-    # Force V4L2 backend — required on Jetson Nano (default backend causes
-    # "select timeout" and null-Mat errors with both USB and CSI cameras).
-    cap = cv2.VideoCapture(args.camera, cv2.CAP_V4L2)
-    if not cap.isOpened():
+    cap = open_camera(args.camera)
+    if cap is None or not cap.isOpened():
         sys.exit("Cannot open camera {}".format(args.camera))
-
-    # Drain warmup frames — Jetson camera needs a few frames before it
-    # delivers valid data; reading too early returns a null Mat.
-    print("Warming up camera...")
-    for _ in range(10):
-        cap.read()
-        time.sleep(0.05)
     print("Camera {} ready. Press q or ESC to quit.\n".format(args.camera))
 
     prev_flag  = None

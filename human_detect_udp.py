@@ -115,44 +115,57 @@ class Yolov4Detector:
 
 def open_camera(index):
     """
-    Open the camera robustly on Jetson Nano + old OpenCV.
+    Open the camera on Jetson Nano (CSI or USB) or Mac.
 
-    Strategy (tried in order):
-      1. GStreamer V4L2 pipeline — bypasses the FFMPEG backend that causes
-         'select timeout' on Jetson.  Requires OpenCV built with GStreamer
-         (standard on JetPack).
-      2. Plain VideoCapture(index) — fallback for Mac / non-GStreamer builds.
-
-    Resolution is set low (320x240) to avoid format negotiation timeouts.
+    Tried in order:
+      1. nvarguscamerasrc  — Jetson CSI camera (IMX219 / IMX477 etc.)
+                             Uses NVIDIA's ISP directly, most reliable on Jetson.
+      2. v4l2src           — USB camera on Linux via GStreamer.
+      3. Plain VideoCapture— fallback for Mac and non-GStreamer builds.
     """
-    device = "/dev/video{}".format(index)
 
-    # Option 1: GStreamer pipeline
-    gst = (
-        "v4l2src device={} ! "
+    # ── Option 1: Jetson CSI camera ───────────────────────────────────────
+    gst_csi = (
+        "nvarguscamerasrc sensor-id={} ! "
+        "video/x-raw(memory:NVMM),width=320,height=240,framerate=15/1 ! "
+        "nvvidconv ! "
+        "video/x-raw,format=BGR ! "
+        "appsink drop=true sync=false"
+    ).format(index)
+
+    cap = cv2.VideoCapture(gst_csi, cv2.CAP_GSTREAMER)
+    if cap.isOpened():
+        for _ in range(5):
+            ret, frame = cap.read()
+            if ret and frame is not None and frame.size > 0:
+                print("Camera opened via nvarguscamerasrc (CSI)")
+                return cap
+        cap.release()
+
+    # ── Option 2: USB camera via GStreamer V4L2 ───────────────────────────
+    gst_usb = (
+        "v4l2src device=/dev/video{} ! "
         "video/x-raw,width=320,height=240,framerate=15/1 ! "
         "videoconvert ! "
         "video/x-raw,format=BGR ! "
         "appsink drop=true sync=false"
-    ).format(device)
+    ).format(index)
 
-    cap = cv2.VideoCapture(gst, cv2.CAP_GSTREAMER)
+    cap = cv2.VideoCapture(gst_usb, cv2.CAP_GSTREAMER)
     if cap.isOpened():
-        # Confirm frames actually arrive
         for _ in range(5):
             ret, frame = cap.read()
             if ret and frame is not None and frame.size > 0:
-                print("Camera opened via GStreamer pipeline")
+                print("Camera opened via v4l2src (USB)")
                 return cap
         cap.release()
 
-    # Option 2: plain open (works on Mac; may hit select timeout on Jetson)
-    print("GStreamer failed, trying direct open...")
+    # ── Option 3: plain open (Mac / no GStreamer) ─────────────────────────
+    print("GStreamer pipelines failed, trying direct open (Mac / fallback)...")
     cap = cv2.VideoCapture(index)
     if cap.isOpened():
         cap.set(cv2.CAP_PROP_FRAME_WIDTH,  320)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
-        cap.set(cv2.CAP_PROP_FPS, 15)
         for _ in range(10):
             ret, frame = cap.read()
             time.sleep(0.05)
